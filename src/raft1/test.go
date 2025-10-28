@@ -2,6 +2,7 @@ package raft
 
 import (
 	"fmt"
+
 	//log
 	"math/rand"
 	"sync"
@@ -11,7 +12,7 @@ import (
 
 	"6.5840/labrpc"
 	"6.5840/raftapi"
-	"6.5840/tester1"
+	tester "6.5840/tester1"
 )
 
 type Test struct {
@@ -64,13 +65,16 @@ func (ts *Test) restart(i int) {
 func (ts *Test) checkOneLeader() int {
 	tester.AnnotateCheckerBegin("checking for a single leader")
 	for iters := 0; iters < 10; iters++ {
+
 		ms := 450 + (rand.Int63() % 100)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 
 		leaders := make(map[int][]int)
 		for i := 0; i < ts.n; i++ {
+
 			if ts.g.IsConnected(i) {
 				if term, leader := ts.srvs[i].GetState(); leader {
+
 					leaders[term] = append(leaders[term], i)
 				}
 			}
@@ -92,6 +96,7 @@ func (ts *Test) checkOneLeader() int {
 			details := fmt.Sprintf("leader in term %v = %v",
 				lastTermWithLeader, leaders[lastTermWithLeader][0])
 			tester.AnnotateCheckerSuccess(details, details)
+
 			return leaders[lastTermWithLeader][0]
 		}
 	}
