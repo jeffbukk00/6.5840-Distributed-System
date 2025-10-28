@@ -2,14 +2,15 @@ package lock
 
 import (
 	"fmt"
+
 	//	"log"
 	"strconv"
 	"testing"
 	"time"
 
-	"6.5840/kvsrv1"
+	kvsrv "6.5840/kvsrv1"
 	"6.5840/kvsrv1/rpc"
-	"6.5840/kvtest1"
+	kvtest "6.5840/kvtest1"
 )
 
 const (
@@ -21,11 +22,13 @@ const (
 func oneClient(t *testing.T, me int, ck kvtest.IKVClerk, done chan struct{}) kvtest.ClntRes {
 	lk := MakeLock(ck, "l")
 	ck.Put("l0", "", 0)
+
 	for i := 1; true; i++ {
 		select {
 		case <-done:
 			return kvtest.ClntRes{i, 0}
 		default:
+
 			lk.Acquire()
 
 			// log.Printf("%d: acquired lock", me)

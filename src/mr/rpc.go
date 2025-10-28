@@ -1,36 +1,122 @@
 package mr
 
-//
-// RPC definitions.
-//
-// remember to capitalize all names.
-//
+import (
+	"os"
+	"strconv"
+)
 
-import "os"
-import "strconv"
+// ------------------------
+// RPC method name constants
+// Used to avoid hard-coded strings
+// ------------------------
+const (
+	CoordinatorService = "CoordinatorService"
+	SignalService      = "SignalService"
+	ShuffleService     = "ShuffleService"
+)
 
-//
-// example to show how to declare the arguments
-// and reply for an RPC.
-//
+const (
+	CoordinatorConnect        = "CoordinatorService.Connect"
+	CoordinatorSchedule       = "CoordinatorService.Schedule"
+	CoordinatorFetchInputPath = "CoordinatorService.FetchInputPath"
+	coordinatorCommitoutput   = "CoordinatorService.CommitOutput"
+)
 
-type ExampleArgs struct {
-	X int
+const (
+	SignalPing = "SignalService.Ping"
+)
+
+const (
+	ShuffleFetch = "ShuffleService.FetchForShuffle"
+)
+
+// ------------------------
+// Args and reply type definitions for general RPC methods
+// ------------------------
+
+// ConnectArgs is an argument type of RPC method "CoordinatorService.Connect"
+type ConnectArgs struct {
 }
 
-type ExampleReply struct {
-	Y int
+// ConnectReply is a return type of RPC method "CoordinatorService.Connect"
+type ConnectReply struct {
+	Profile WorkerProfile
 }
 
-// Add your RPC definitions here.
+// ScheduleArgs is an argument type of RPC method "CoordinatorService.Schedule"
+type ScheduleArgs struct {
+	Profile WorkerProfile
+}
 
+// ScheduleReply is a return type of RPC method "CoordinatorService.Schedule"
+type ScheduleReply struct {
+	Task AssignedTask
+}
 
-// Cook up a unique-ish UNIX-domain socket name
-// in /var/tmp, for the coordinator.
-// Can't use the current directory since
-// Athena AFS doesn't support UNIX-domain sockets.
-func coordinatorSock() string {
+// FetchInputPathArgs is an argument type of RPC method "CoordinatorService.FetchInputPath"
+type FetchInputPathArgs struct {
+	Profile     WorkerProfile
+	Task        AssignedTask
+	WhatToFetch []int
+}
+
+// FetchInputPathReply is a return type of RPC method "CoordinatorService.FetchInputPath"
+type FetchInputPathReply struct {
+	InputPaths []Path
+}
+
+// CommitOutputArgs is an argument type of RPC method "CoordinatorService.CommitOutput"
+type CommitOutputArgs struct {
+	Profile    WorkerProfile
+	Task       AssignedTask
+	OutputPath []Path
+}
+
+// CommitOutputReply is a return type of RPC method "CoordinatorService.CommitOutput"
+type CommitOutputReply struct{}
+
+// ------------------------
+// Args and reply type definitions for signaling
+// ------------------------
+
+// PingArgs is an argument type of RPC method "SignalService.Ping"
+type PingArgs struct {
+	WorkerID int
+}
+
+// PingReply is a return type of RPC method "SignalService.Ping"
+type PingReply struct {
+	Resp PingResponse
+}
+
+// ------------------------
+// Args and reply type definitions for shuffling
+// ------------------------
+
+// FetchForShuffleArgs is an argument type of RPC method "ShuffleService.FetchForShuffle"
+type FetchForShuffleArgs struct {
+	Filename string
+	Offset   int64
+	Size     int
+}
+
+// FetchForShuffleReply is a return type of RPC method "ShuffleService.FetchForShuffle"
+type FetchForShuffleReply struct {
+	Data   []byte
+	Offset int64
+	EOF    bool
+}
+
+func CoordinatorSock() string {
 	s := "/var/tmp/5840-mr-"
 	s += strconv.Itoa(os.Getuid())
+	return s
+}
+
+func ShuffleServerSock() string {
+	s := "/var/tmp/mr-shuffle-"
+	s += strconv.Itoa(os.Getuid()) + "-"
+	s += strconv.Itoa(os.Getpid())
+
 	return s
 }

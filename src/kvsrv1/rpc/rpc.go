@@ -1,3 +1,4 @@
+// Package rpc is ...
 package rpc
 
 type Err string
@@ -37,4 +38,3 @@ type GetReply struct {
 	Version Tversion
 	Err     Err
 }
-
