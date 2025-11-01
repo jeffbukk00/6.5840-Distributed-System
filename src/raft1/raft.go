@@ -98,10 +98,6 @@ type Voter struct {
 	granted   bool
 }
 
-type EpochByTick struct {
-	current *atomic.Int64
-}
-
 type ExitSyncContext struct {
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -214,162 +210,6 @@ func (rf *Raft) exitInSync() {
 	log.Printf("<INFO> [Raft was exited in sync] \n")
 }
 
-func (rf *Raft) roleToStr(role Role) string {
-	var str string
-
-	switch role {
-	case Follower:
-		str = "Follower"
-	case Candidate:
-		str = "Candidate"
-	case Leader:
-		str = "Leader"
-	}
-
-	return str
-}
-
-func (rf *Raft) runRoleTransitioner() {
-	rf.exitSync.wg.Add(1)
-	defer rf.exitSync.wg.Done()
-
-	for {
-		select {
-		case msg := <-rf.roleState.roleTransition.roleTransitionChan:
-
-			if rf.roleState.roleTransition.knownEpochByRole > msg.epochByRoleSnapshot {
-				break
-			}
-
-			log.Printf("<INFO> [Try to synchronize role transition] me %v / term: %v / old role: %v / new role: %v / Epoch: %v \n",
-				rf.me, msg.term, rf.roleToStr(msg.oldRole), rf.roleToStr(msg.newRole), msg.epochByRoleSnapshot)
-
-			rf.roleState.roleTransition.knownEpochByRole = msg.epochByRoleSnapshot
-
-			if rf.roleState.roleTransition.ctx != nil && rf.roleState.roleTransition.cancel != nil {
-				rf.roleState.roleTransition.cancel()
-				rf.roleState.roleTransition.wg.Wait()
-			}
-
-			log.Printf("<INFO> [Role transition was synchronized] me %v / term: %v / old role: %v / new role: %v / Epoch: %v \n",
-				rf.me, msg.term, rf.roleToStr(msg.oldRole), rf.roleToStr(msg.newRole), msg.epochByRoleSnapshot)
-
-			if msg.newRole != Follower {
-				rf.roleState.roleTransition.ctx, rf.roleState.roleTransition.cancel = context.WithCancel(context.Background())
-			}
-
-			rf.resetElectionTimeout()
-
-			switch msg.newRole {
-			case Candidate:
-				go rf.runCandidateWorker(msg.epochByRoleSnapshot)
-			case Leader:
-				go rf.runLeaderWorker(msg.epochByRoleSnapshot)
-			}
-
-		case <-rf.exitSync.ctx.Done():
-			return
-		}
-	}
-}
-
-func (rf *Raft) transitRole(term int, oldRole Role, newRole Role, epoch uint64) {
-	go func() {
-
-		msg := RoleTransitionMsg{
-			epochByRoleSnapshot: epoch,
-			term:                term,
-			oldRole:             oldRole,
-			newRole:             newRole,
-		}
-
-		rf.roleState.roleTransition.roleTransitionChan <- msg
-
-	}()
-
-}
-
-func (rf *Raft) isFencedByRoleTransition(epochByRoleSnapshot uint64) bool {
-	if epochByRoleSnapshot < rf.roleState.epochByRole {
-		return true
-	}
-
-	return false
-}
-
-func (rf *Raft) resetElectionTimeout() {
-	rf.electionTimeoutState.resetFlag.Store(1)
-}
-
-func (rf *Raft) shouldResetElectionTimeout() bool {
-	if rf.electionTimeoutState.resetFlag.Load() == 1 {
-		return true
-	}
-	return false
-}
-
-func (rf *Raft) runElectionTimeout() {
-	rf.exitSync.wg.Add(1)
-	defer rf.exitSync.wg.Done()
-
-	newRandomTimer := func() *time.Timer {
-		randomDuration := time.Duration(ElectionTimeoutBase+(rand.Int63()%ElectionTimeoutBase)) * time.Millisecond
-		return time.NewTimer(randomDuration)
-	}
-
-	onTick := newRandomTimer()
-
-	for {
-		select {
-		case <-onTick.C:
-			onTick = newRandomTimer()
-
-			if rf.shouldResetElectionTimeout() {
-				rf.electionTimeoutState.resetFlag.Store(0)
-			} else {
-
-				rf.mu.Lock()
-				if rf.roleState.role == Leader {
-					rf.mu.Unlock()
-					break
-				}
-
-				log.Printf("<INFO> [Election timeout was expired] me: %v / term: %v \n", rf.me, rf.currentTerm)
-
-				rf.currentTerm++
-				rf.votedFor = rf.me
-
-				var term int
-				var oldRole Role
-				var newRole Role
-				var nextEpoch uint64
-
-				term = rf.currentTerm
-				oldRole = rf.roleState.role
-
-				rf.roleState.role = Candidate
-				rf.roleState.epochByRole++
-
-				newRole = rf.roleState.role
-				nextEpoch = rf.roleState.epochByRole
-
-				log.Printf("<INFO> [Role was transitioned] me %v / term: %v / old role: %v / new role: %v / Epoch: %v \n",
-					rf.me, term, rf.roleToStr(oldRole), rf.roleToStr(newRole), nextEpoch)
-
-				rf.transitRole(term, oldRole, newRole, nextEpoch)
-
-				rf.mu.Unlock()
-
-			}
-
-		case <-rf.exitSync.ctx.Done():
-			onTick.Stop()
-			return
-		}
-	}
-
-}
-
 type RequestVoteArgs struct {
 	Term         int
 	CandidiateId int
@@ -421,7 +261,56 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.resetElectionTimeout()
 }
 
-func (rf *Raft) runCandidateWorker(epochByRoleSnapshot uint64) {
+type AppendEntriesArgs struct {
+	Term     int
+	LeaderId int
+
+	// PrevLogIndex int
+	// PrevLogTerm int
+	// Entries[]
+	// LeaderCommit int
+}
+
+type AppendEntriesReply struct {
+	Term    int
+	Success bool
+}
+
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if rf.currentTerm > args.Term || rf.roleState.role == Leader {
+		reply.Term = rf.currentTerm
+		reply.Success = false
+
+		return
+	}
+
+	// there is a leader with same or higher term when current role is Candidate
+	// election is closed
+	if rf.currentTerm <= args.Term && rf.roleState.role == Candidate {
+
+		rf.currentTerm = args.Term
+		rf.votedFor = args.LeaderId
+
+		rf.transitRole(Follower)
+
+		reply.Term = rf.currentTerm
+		reply.Success = false
+
+		return
+	}
+
+	rf.currentTerm = args.Term
+
+	reply.Term = rf.currentTerm
+	reply.Success = true
+
+	rf.resetElectionTimeout()
+}
+
+func (rf *Raft) runCandidate(epochByRoleSnapshot uint64) {
 	rf.roleState.roleTransition.wg.Add(1)
 	defer rf.roleState.roleTransition.wg.Done()
 
@@ -507,24 +396,7 @@ func (rf *Raft) sendRequestVote(epochByRoleSnapshot uint64, peer int) {
 		rf.currentTerm = reply.Term
 		rf.votedFor = -1
 
-		var term int
-		var oldRole Role
-		var newRole Role
-		var nextEpoch uint64
-
-		term = rf.currentTerm
-		oldRole = rf.roleState.role
-
-		rf.roleState.role = Follower
-		rf.roleState.epochByRole++
-
-		newRole = rf.roleState.role
-		nextEpoch = rf.roleState.epochByRole
-
-		log.Printf("<INFO> [Role was transitioned] me %v / term: %v / old role: %v / new role: %v / Epoch: %v \n",
-			rf.me, term, rf.roleToStr(oldRole), rf.roleToStr(newRole), nextEpoch)
-
-		rf.transitRole(term, oldRole, newRole, nextEpoch)
+		rf.transitRole(Follower)
 
 		rf.mu.Unlock()
 
@@ -550,25 +422,9 @@ func (rf *Raft) sendRequestVote(epochByRoleSnapshot uint64, peer int) {
 			// validation to be Leader
 			if rf.election.voteCount >= len(rf.peers)/2+1 {
 
-				var term int
-				var oldRole Role
-				var newRole Role
-				var nextEpoch uint64
-
-				term = rf.currentTerm
-				oldRole = rf.roleState.role
-
-				rf.roleState.role = Leader
-				rf.roleState.epochByRole++
-
-				newRole = rf.roleState.role
-				nextEpoch = rf.roleState.epochByRole
-
 				log.Printf("<INFO> [Leader is elected] me: %v / term: %v \n", rf.me, rf.currentTerm)
-				log.Printf("<INFO> [Role was transitioned] me %v / term: %v / old role: %v / new role: %v / Epoch: %v \n",
-					rf.me, term, rf.roleToStr(oldRole), rf.roleToStr(newRole), nextEpoch)
 
-				rf.transitRole(term, oldRole, newRole, nextEpoch)
+				rf.transitRole(Leader)
 			}
 		}
 
@@ -576,90 +432,21 @@ func (rf *Raft) sendRequestVote(epochByRoleSnapshot uint64, peer int) {
 	rf.mu.Unlock()
 }
 
-type AppendEntriesArgs struct {
-	Term     int
-	LeaderId int
-
-	// PrevLogIndex int
-	// PrevLogTerm int
-	// Entries[]
-	// LeaderCommit int
-}
-
-type AppendEntriesReply struct {
-	Term    int
-	Success bool
-}
-
-func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
-	if rf.currentTerm > args.Term || rf.roleState.role == Leader {
-		reply.Term = rf.currentTerm
-		reply.Success = false
-
-		return
-	}
-
-	// there is a leader with same or higher term when current role is Candidate
-	// election is closed
-	if rf.currentTerm <= args.Term && rf.roleState.role == Candidate {
-
-		rf.currentTerm = args.Term
-		rf.votedFor = args.LeaderId
-
-		var term int
-		var oldRole Role
-		var newRole Role
-		var nextEpoch uint64
-
-		oldRole = rf.roleState.role
-		rf.roleState.role = Follower
-		rf.roleState.epochByRole++
-
-		term = rf.currentTerm
-		newRole = rf.roleState.role
-		nextEpoch = rf.roleState.epochByRole
-
-		log.Printf("<INFO> [Role was transitioned] me %v / term: %v / old role: %v / new role: %v / Epoch: %v \n",
-			rf.me, term, rf.roleToStr(oldRole), rf.roleToStr(newRole), nextEpoch)
-
-		rf.transitRole(term, oldRole, newRole, nextEpoch)
-
-		reply.Term = rf.currentTerm
-		reply.Success = false
-
-		return
-	}
-
-	rf.currentTerm = args.Term
-
-	reply.Term = rf.currentTerm
-	reply.Success = true
-
-	rf.resetElectionTimeout()
-}
-
-func (rf *Raft) runLeaderWorker(epochByRoleSnapshot uint64) {
+func (rf *Raft) runLeader(epochByRoleSnapshot uint64) {
 	rf.roleState.roleTransition.wg.Add(1)
 	defer rf.roleState.roleTransition.wg.Done()
 
 	heartbeatTicker := time.NewTicker(HeartbeatInterval * time.Millisecond)
 	defer heartbeatTicker.Stop()
 
-	epochByTick := &EpochByTick{
-		current: &atomic.Int64{},
-	}
-
-	fanoutTick := make([]chan int64, len(rf.peers))
+	fanoutTick := make([]chan struct{}, len(rf.peers))
 
 	for i, _ := range rf.peers {
 		if i != rf.me {
-			tickNotificationChan := make(chan int64)
+			tickNotificationChan := make(chan struct{})
 			fanoutTick[i] = tickNotificationChan
 
-			go rf.runHeartbeatHandler(epochByRoleSnapshot, i, epochByTick, tickNotificationChan)
+			go rf.runHeartbeatHandler(epochByRoleSnapshot, i, tickNotificationChan)
 		}
 	}
 
@@ -667,19 +454,17 @@ func (rf *Raft) runLeaderWorker(epochByRoleSnapshot uint64) {
 		select {
 		case <-heartbeatTicker.C:
 
-			currentEpochSnapshot := epochByTick.current.Load()
-
 			for i, tickNotificationChan := range fanoutTick {
 				if i != rf.me {
 					select {
-					case tickNotificationChan <- currentEpochSnapshot:
+					case tickNotificationChan <- struct{}{}:
 					default:
-						// cannot command sending a heartbeat to a worker on current tick
+						// cannot command sending a heartbeat to a  on current tick
 					}
 				}
 
 			}
-			epochByTick.current.Add(1)
+
 		case <-rf.roleState.roleTransition.ctx.Done():
 			return
 		}
@@ -687,16 +472,16 @@ func (rf *Raft) runLeaderWorker(epochByRoleSnapshot uint64) {
 
 }
 
-func (rf *Raft) runHeartbeatHandler(epochByRoleSnapshot uint64, peer int, epochByTick *EpochByTick, tickNotificationChan chan int64) {
+func (rf *Raft) runHeartbeatHandler(epochByRoleSnapshot uint64, peer int, tickNotificationChan chan struct{}) {
 
 	rf.roleState.roleTransition.wg.Add(1)
 	defer rf.roleState.roleTransition.wg.Done()
 
 	for {
 		select {
-		case epochByTickSnapshot := <-tickNotificationChan:
+		case <-tickNotificationChan:
 
-			go rf.sendAppendEntries(epochByRoleSnapshot, peer, epochByTick, epochByTickSnapshot)
+			go rf.sendAppendEntries(epochByRoleSnapshot, peer)
 		case <-rf.roleState.roleTransition.ctx.Done():
 			// aborted by role update
 			return
@@ -705,7 +490,7 @@ func (rf *Raft) runHeartbeatHandler(epochByRoleSnapshot uint64, peer int, epochB
 
 }
 
-func (rf *Raft) sendAppendEntries(epochByRoleSnapshot uint64, peer int, epochByTick *EpochByTick, epochByTickSnapshot int64) {
+func (rf *Raft) sendAppendEntries(epochByRoleSnapshot uint64, peer int) {
 	// no deadline for RPC requests
 	// fencing by roleVersion is required
 	rf.mu.Lock()
@@ -725,12 +510,6 @@ func (rf *Raft) sendAppendEntries(epochByRoleSnapshot uint64, peer int, epochByT
 
 	ok := rf.peers[peer].Call("Raft.AppendEntries", args,
 		reply)
-	// log.Printf("CHECKPOINT #1 %v %v %v \n", rf.me, rf.currentTerm, rf.roleState.role)
-	// stale response by tick
-	// if epochByTick.current.Load() > epochByTickSnapshot {
-
-	// 	return
-	// }
 
 	// no response
 	if !ok {
@@ -749,24 +528,7 @@ func (rf *Raft) sendAppendEntries(epochByRoleSnapshot uint64, peer int, epochByT
 		rf.currentTerm = reply.Term
 		rf.votedFor = -1
 
-		var term int
-		var oldRole Role
-		var newRole Role
-		var nextEpoch uint64
-
-		term = rf.currentTerm
-		oldRole = rf.roleState.role
-
-		rf.roleState.role = Follower
-		rf.roleState.epochByRole++
-
-		newRole = rf.roleState.role
-		nextEpoch = rf.roleState.epochByRole
-
-		log.Printf("<INFO> [Role was transitioned] me %v / term: %v / old role: %v / new role: %v / Epoch: %v \n",
-			rf.me, term, rf.roleToStr(oldRole), rf.roleToStr(newRole), nextEpoch)
-
-		rf.transitRole(term, oldRole, newRole, nextEpoch)
+		rf.transitRole(Follower)
 
 		rf.mu.Unlock()
 
@@ -774,6 +536,144 @@ func (rf *Raft) sendAppendEntries(epochByRoleSnapshot uint64, peer int, epochByT
 	}
 
 	rf.mu.Unlock()
+}
+
+func (rf *Raft) runRoleTransitioner() {
+	rf.exitSync.wg.Add(1)
+	defer rf.exitSync.wg.Done()
+
+	for {
+		select {
+		case msg := <-rf.roleState.roleTransition.roleTransitionChan:
+
+			if rf.roleState.roleTransition.knownEpochByRole > msg.epochByRoleSnapshot {
+				break
+			}
+
+			log.Printf("<INFO> [Try to synchronize role transition] me %v / term: %v / old role: %v / new role: %v / Epoch: %v \n",
+				rf.me, msg.term, rf.roleToStr(msg.oldRole), rf.roleToStr(msg.newRole), msg.epochByRoleSnapshot)
+
+			rf.roleState.roleTransition.knownEpochByRole = msg.epochByRoleSnapshot
+
+			if rf.roleState.roleTransition.ctx != nil && rf.roleState.roleTransition.cancel != nil {
+				rf.roleState.roleTransition.cancel()
+				rf.roleState.roleTransition.wg.Wait()
+			}
+
+			log.Printf("<INFO> [Role transition was synchronized] me %v / term: %v / old role: %v / new role: %v / Epoch: %v \n",
+				rf.me, msg.term, rf.roleToStr(msg.oldRole), rf.roleToStr(msg.newRole), msg.epochByRoleSnapshot)
+
+			if msg.newRole != Follower {
+				rf.roleState.roleTransition.ctx, rf.roleState.roleTransition.cancel = context.WithCancel(context.Background())
+			}
+
+			switch msg.newRole {
+			case Candidate:
+				go rf.runCandidate(msg.epochByRoleSnapshot)
+			case Leader:
+				go rf.runLeader(msg.epochByRoleSnapshot)
+			}
+
+			rf.resetElectionTimeout()
+
+		case <-rf.exitSync.ctx.Done():
+			return
+		}
+	}
+}
+
+func (rf *Raft) transitRole(newRole Role) {
+	var term int
+	var oldRole Role
+	var nextEpoch uint64
+
+	oldRole = rf.roleState.role
+	rf.roleState.role = newRole
+	rf.roleState.epochByRole++
+
+	term = rf.currentTerm
+	nextEpoch = rf.roleState.epochByRole
+
+	log.Printf("<INFO> [Role was transitioned] me %v / term: %v / old role: %v / new role: %v / Epoch: %v \n",
+		rf.me, term, rf.roleToStr(oldRole), rf.roleToStr(newRole), nextEpoch)
+
+	go func() {
+
+		msg := RoleTransitionMsg{
+			epochByRoleSnapshot: nextEpoch,
+			term:                term,
+			oldRole:             oldRole,
+			newRole:             newRole,
+		}
+
+		rf.roleState.roleTransition.roleTransitionChan <- msg
+
+	}()
+
+}
+
+func (rf *Raft) isFencedByRoleTransition(epochByRoleSnapshot uint64) bool {
+	if epochByRoleSnapshot < rf.roleState.epochByRole {
+		return true
+	}
+
+	return false
+}
+
+func (rf *Raft) runElectionTimeout() {
+	rf.exitSync.wg.Add(1)
+	defer rf.exitSync.wg.Done()
+
+	newRandomTimer := func() *time.Timer {
+		randomDuration := time.Duration(ElectionTimeoutBase+(rand.Int63()%ElectionTimeoutBase)) * time.Millisecond
+		return time.NewTimer(randomDuration)
+	}
+
+	onTick := newRandomTimer()
+
+	for {
+		select {
+		case <-onTick.C:
+			onTick = newRandomTimer()
+
+			if rf.shouldResetElectionTimeout() {
+				rf.electionTimeoutState.resetFlag.Store(0)
+			} else {
+
+				rf.mu.Lock()
+				if rf.roleState.role == Leader {
+					rf.mu.Unlock()
+					break
+				}
+
+				log.Printf("<INFO> [Election timeout was expired] me: %v / term: %v \n", rf.me, rf.currentTerm)
+
+				rf.currentTerm++
+				rf.votedFor = rf.me
+
+				rf.transitRole(Candidate)
+
+				rf.mu.Unlock()
+
+			}
+
+		case <-rf.exitSync.ctx.Done():
+			onTick.Stop()
+			return
+		}
+	}
+
+}
+
+func (rf *Raft) resetElectionTimeout() {
+	rf.electionTimeoutState.resetFlag.Store(1)
+}
+
+func (rf *Raft) shouldResetElectionTimeout() bool {
+	if rf.electionTimeoutState.resetFlag.Load() == 1 {
+		return true
+	}
+	return false
 }
 
 // the service or tester wants to create a Raft server. the ports
@@ -806,4 +706,19 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	go rf.runElectionTimeout()
 
 	return rf
+}
+
+func (rf *Raft) roleToStr(role Role) string {
+	var str string
+
+	switch role {
+	case Follower:
+		str = "Follower"
+	case Candidate:
+		str = "Candidate"
+	case Leader:
+		str = "Leader"
+	}
+
+	return str
 }
