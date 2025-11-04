@@ -25,7 +25,7 @@ const HeartbeatInterval = 40
 const ElectionTimeoutBase = 300
 const RequestVoteBackOff = 100
 const MaxNumEntriesSentPerEachHeartbeat = 10
-const NumberOfStepsForFindingMatchedIndex = 5
+const NumberOfStepsForFindingMatchedIndex = 1
 
 type Role int
 
@@ -342,8 +342,15 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term    int
-	Success bool
+	Term     int
+	Success  bool
+	metadata MetatdataForLogMatch
+}
+
+type MetatdataForLogMatch struct {
+	XTerm  int
+	XIndex int
+	XLen   int
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -383,7 +390,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// find matched index
 	wasMatched := args.PrevLogTerm == -1 && args.PrevLogIndex == -1
 	if !wasMatched {
-
+		reply.metadata.XLen = len(rf.log)
 		if len(rf.log) <= args.PrevLogIndex {
 			reply.Success = false
 		} else {
@@ -391,6 +398,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				reply.Success = true
 			} else {
 				reply.Success = false
+				reply.metadata.XTerm = rf.log[args.PrevLogIndex].Term
+				firstIndexAtTerm := args.PrevLogIndex
+				for ; firstIndexAtTerm > -1; firstIndexAtTerm-- {
+					if rf.log[firstIndexAtTerm].Term < reply.metadata.XTerm {
+						break
+					}
+				}
+				firstIndexAtTerm++
+				reply.metadata.XIndex = firstIndexAtTerm
 			}
 		}
 		return
@@ -761,6 +777,46 @@ func (rf *Raft) sendAppendEntries(epochByRoleSnapshot uint64, peer int, tickCoun
 
 			if rf.commit() {
 				rf.apply()
+			}
+		}
+	} else {
+		if reply.metadata.XLen <= rf.nextIndex[peer] {
+			//  Case 1: follower's log is too short:
+			rf.nextIndex[peer] = reply.metadata.XLen
+		} else {
+
+			isTermMatched := false
+
+			var termMatchedIndex int
+			targetTerm := reply.metadata.XTerm
+			left, right := 0, len(rf.log)-1
+
+			for left <= right {
+				termMatchedIndex := left + (right-left)/2
+
+				if rf.log[termMatchedIndex].Term == targetTerm {
+					isTermMatched = true
+				} else if rf.log[termMatchedIndex].Term < targetTerm {
+					left = termMatchedIndex + 1
+				} else {
+					right = termMatchedIndex - 1
+				}
+			}
+
+			if isTermMatched {
+				// Case 2: leader has XTerm:
+				lastIndexAtTerm := termMatchedIndex
+
+				for ; lastIndexAtTerm < len(rf.log); lastIndexAtTerm++ {
+					if targetTerm < rf.log[lastIndexAtTerm].Term {
+						break
+					}
+				}
+
+				rf.nextIndex[peer] = lastIndexAtTerm
+			} else {
+				// Case 3: leader doesn't have XTerm:
+				rf.nextIndex[peer] = reply.metadata.XIndex // index of first entry with that term (if any)
 			}
 		}
 	}
