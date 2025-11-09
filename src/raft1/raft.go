@@ -8,6 +8,7 @@ package raft
 
 import (
 	//	"bytes"
+	"bytes"
 	"context"
 	"log"
 	"math/rand"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	//	"6.5840/labgob"
+	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raftapi"
 	tester "6.5840/tester1"
@@ -24,7 +26,7 @@ import (
 const HeartbeatInterval = 40
 const ElectionTimeoutBase = 300
 const RequestVoteBackOff = 100
-const MaxNumEntriesSentPerEachHeartbeat = 10
+const MaxNumEntriesSentPerEachHeartbeat = 30
 const NumberOfStepsForFindingMatchedIndex = 1
 
 type Role int
@@ -47,15 +49,16 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
-	currentTerm int
-	votedFor    int // nil is -1
-	log         []Entry
+	CurrentTerm int
+	VotedFor    int // nil is -1
+	Log         []Entry
 
 	commitIndex int
 	lastApplied int
 
 	nextIndex    []int
 	matchedIndex []int
+	matched      []bool
 
 	roleState RoleState
 
@@ -122,10 +125,10 @@ func (rf *Raft) GetState() (int, bool) {
 	defer rf.mu.Unlock()
 
 	if rf.roleState.role == Leader {
-		return rf.currentTerm, true
+		return rf.CurrentTerm, true
 	}
 	// Your code here (3A).
-	return rf.currentTerm, false
+	return rf.CurrentTerm, false
 }
 
 // save Raft's persistent state to stable storage,
@@ -144,26 +147,62 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// raftstate := w.Bytes()
 	// rf.persister.Save(raftstate, nil)
+
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+
+	var err error
+
+	if err = e.Encode(rf.CurrentTerm); err != nil {
+		log.Fatal("encode error:", err)
+	}
+
+	if err = e.Encode(rf.VotedFor); err != nil {
+		log.Fatal("encode error:", err)
+	}
+
+	if err = e.Encode(rf.Log); err != nil {
+		log.Fatal("encode error:", err)
+	}
+
+	raftState := w.Bytes()
+	rf.persister.Save(raftState, nil)
+
 }
 
 // restore previously persisted state.
-func (rf *Raft) readPersist(data []byte) {
+func (rf *Raft) readPersist(data []byte) bool {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
-		return
+		return false
 	}
 	// Your code here (3C).
 	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+
+	var currentTermPersisted int
+	var votedForPersisted int
+	var logPersisted []Entry
+
+	var err error
+
+	if err = d.Decode(&currentTermPersisted); err != nil {
+		log.Fatal("encode error:", err)
+	}
+
+	if err = d.Decode(&votedForPersisted); err != nil {
+		log.Fatal("encode error:", err)
+	}
+
+	if err = d.Decode(&logPersisted); err != nil {
+		log.Fatal("encode error:", err)
+	}
+
+	rf.CurrentTerm = currentTermPersisted
+	rf.VotedFor = votedForPersisted
+	rf.Log = logPersisted
+
+	return true
 }
 
 // how many bytes in Raft's persisted log?
@@ -200,24 +239,28 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	index := -1
 	term := -1
-	isLeader := true
+	isLeader := false
 
 	// Your code here (3B).
 	if rf.roleState.role == Leader {
-		index = len(rf.log)
-		term = rf.currentTerm
+		isLeader = true
 
-		rf.log = append(rf.log, Entry{Index: index, Term: rf.currentTerm, Command: command})
-		log.Printf("<INFO> [Log was received from a client] me: %v / role: %v / term: %v / index: %v \n",
-			rf.me, rf.roleToStr(rf.roleState.role), rf.currentTerm, index)
-	} else {
-		isLeader = false
+		index = len(rf.Log)
+		term = rf.CurrentTerm
+
+		rf.Log = append(rf.Log, Entry{Index: index, Term: term, Command: command})
+		rf.persist()
+
+		log.Printf("<INFO> [Log was received from a client] me: %v / role: %v / term: %v / index: %v / command: %v \n",
+			rf.me, rf.roleToStr(rf.roleState.role), rf.CurrentTerm, index, command)
+
 	}
 
 	return index, term, isLeader
 }
 
 func (rf *Raft) Kill() {
+
 	rf.exitInSync()
 	atomic.StoreInt32(&rf.dead, 1)
 }
@@ -228,10 +271,11 @@ func (rf *Raft) killed() bool {
 }
 
 func (rf *Raft) exitInSync() {
-	log.Printf("<INFO> [Try to exit raft in sync] \n")
+
+	log.Printf("<INFO> [Try to exit raft in sync] me: %v \n", rf.me)
 	rf.exitSync.cancel()
 	rf.exitSync.wg.Wait()
-	log.Printf("<INFO> [Raft was exited in sync] \n")
+	log.Printf("<INFO> [Raft was exited in sync] me: %v\n", rf.me)
 }
 
 type RequestVoteArgs struct {
@@ -252,22 +296,24 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	if rf.currentTerm > args.Term {
-		reply.Term = rf.currentTerm
+	if rf.CurrentTerm > args.Term {
+		reply.Term = rf.CurrentTerm
 		reply.Voted = false
 		reply.VoteGranted = false
 		return
-	} else if rf.currentTerm == args.Term {
-		reply.Term = rf.currentTerm
+	} else if rf.CurrentTerm == args.Term {
+		reply.Term = rf.CurrentTerm
 		reply.Voted = true
 
 		if rf.roleState.role == Follower {
 			// deduplication
 
-			if rf.votedFor == -1 {
+			if rf.VotedFor == -1 {
 				// validation
 				if rf.validateCandidate(args.LastLogTerm, args.LastLogIndex) {
-					rf.votedFor = args.CandidiateId
+					rf.VotedFor = args.CandidiateId
+					rf.persist()
+
 					reply.VoteGranted = true
 
 					rf.resetElectionTimeout()
@@ -275,7 +321,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 					reply.VoteGranted = false
 				}
 			} else {
-				if rf.votedFor == args.CandidiateId {
+				if rf.VotedFor == args.CandidiateId {
 					reply.VoteGranted = true
 				} else {
 					reply.VoteGranted = false
@@ -286,14 +332,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			reply.VoteGranted = false
 		}
 	} else {
-		rf.currentTerm = args.Term
-		reply.Term = rf.currentTerm
-		reply.Voted = true
-
 		if rf.roleState.role == Follower {
 			// validation
 			if rf.validateCandidate(args.LastLogTerm, args.LastLogIndex) {
-				rf.votedFor = args.CandidiateId
+				rf.VotedFor = args.CandidiateId
 				reply.VoteGranted = true
 
 				rf.resetElectionTimeout()
@@ -305,7 +347,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 			// validation
 			if rf.validateCandidate(args.LastLogTerm, args.LastLogIndex) {
-				rf.votedFor = args.CandidiateId
+				rf.VotedFor = args.CandidiateId
 				reply.VoteGranted = true
 
 				rf.resetElectionTimeout()
@@ -313,19 +355,27 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 				reply.VoteGranted = false
 			}
 		}
+
+		rf.CurrentTerm = args.Term
+		rf.persist()
+
+		reply.Term = rf.CurrentTerm
+		reply.Voted = true
 	}
 
 }
 
 func (rf *Raft) validateCandidate(candidateLastLogTerm int, candidateLastLogIndex int) bool {
-	if len(rf.log) == 0 {
+	if len(rf.Log) == 0 {
 		return true
 	}
 
-	lastLog := rf.log[len(rf.log)-1]
+	lastLogIndex := len(rf.Log) - 1
+	lastLog := rf.Log[lastLogIndex]
 
 	if lastLog.Term < candidateLastLogTerm ||
-		(lastLog.Term == candidateLastLogTerm && lastLog.Index <= candidateLastLogIndex) {
+		(lastLog.Term == candidateLastLogTerm && lastLogIndex <= candidateLastLogIndex) {
+
 		return true
 	}
 
@@ -337,6 +387,7 @@ type AppendEntriesArgs struct {
 	LeaderId     int
 	PrevLogIndex int
 	PrevLogTerm  int
+	WasMatched   bool
 	Entries      []Entry
 	LeaderCommit int
 }
@@ -348,17 +399,17 @@ type AppendEntriesReply struct {
 }
 
 type MetatdataForLogMatch struct {
-	XTerm  int
-	XIndex int
-	XLen   int
+	// XTerm  int
+	// XIndex int
+	XLen int
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	if rf.currentTerm > args.Term || rf.roleState.role == Leader {
-		reply.Term = rf.currentTerm
+	if rf.CurrentTerm > args.Term || rf.roleState.role == Leader {
+		reply.Term = rf.CurrentTerm
 		reply.Success = false
 
 		return
@@ -368,12 +419,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// election is closed
 	if rf.roleState.role == Candidate {
 
-		rf.currentTerm = args.Term
-		rf.votedFor = args.LeaderId
+		rf.CurrentTerm = args.Term
+		rf.VotedFor = args.LeaderId
 
 		rf.transitRole(Follower)
 
-		reply.Term = rf.currentTerm
+		rf.persist()
+
+		reply.Term = rf.CurrentTerm
 		reply.Success = false
 
 		return
@@ -383,62 +436,50 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	rf.resetElectionTimeout()
 
-	rf.currentTerm = args.Term
-	rf.votedFor = args.LeaderId
-	reply.Term = rf.currentTerm
+	rf.CurrentTerm = args.Term
+	rf.VotedFor = args.LeaderId
+	reply.Term = rf.CurrentTerm
 
-	// find matched index
-	wasMatched := args.PrevLogTerm == -1 && args.PrevLogIndex == -1
-	if !wasMatched {
-		reply.metadata.XLen = len(rf.log)
-		if len(rf.log) <= args.PrevLogIndex {
-			reply.Success = false
-		} else {
-			if rf.log[args.PrevLogIndex].Term == args.PrevLogTerm {
-				reply.Success = true
-			} else {
-				reply.Success = false
-				reply.metadata.XTerm = rf.log[args.PrevLogIndex].Term
-				firstIndexAtTerm := args.PrevLogIndex
-				for ; firstIndexAtTerm > -1; firstIndexAtTerm-- {
-					if rf.log[firstIndexAtTerm].Term < reply.metadata.XTerm {
-						break
-					}
-				}
-				firstIndexAtTerm++
-				reply.metadata.XIndex = firstIndexAtTerm
+	if !args.WasMatched {
+		reply.metadata.XLen = len(rf.Log)
+		reply.Success = false
+		if len(rf.Log) > args.PrevLogIndex && rf.Log[args.PrevLogIndex].Term == args.PrevLogTerm {
+			reply.Success = true
+
+			matchedIndex := args.PrevLogIndex
+
+			slicedByMatchedIndex := make([]Entry, matchedIndex+1)
+			for i := 0; i <= matchedIndex; i++ {
+				slicedByMatchedIndex[i] = rf.Log[i]
 			}
-		}
-		return
-	}
+			rf.Log = slicedByMatchedIndex
 
-	reply.Success = true
-
-	// log replication from Leader
-
-	overwrittenindex := -1
-
-	for _, e := range args.Entries {
-		if e.Index < len(rf.log) {
-			// overwrite
-			rf.log[e.Index] = e
-			overwrittenindex = e.Index
-		} else {
-			rf.log = append(rf.log, e)
-			overwrittenindex = -1
+			rf.persist()
 		}
 
-		log.Printf("<INFO> [Log was replicated] me: %v / role: %v / term: %v / index: %v  \n",
-			rf.me, rf.roleToStr(rf.roleState.role), rf.currentTerm, e.Index)
-	}
-
-	if overwrittenindex != -1 {
-		rf.commitIndex = min(overwrittenindex, args.LeaderCommit)
 	} else {
-		rf.commitIndex = min(len(rf.log)-1, args.LeaderCommit)
+		reply.Success = true
+
+		// log replication from Leader
+
+		for _, e := range args.Entries {
+			if e.Index == len(rf.Log) {
+				rf.Log = append(rf.Log, e)
+
+				log.Printf("<INFO> [Log was replicated] me: %v / role: %v / term: %v / index: %v / command: %v  \n",
+					rf.me, rf.roleToStr(rf.roleState.role), rf.CurrentTerm, len(rf.Log)-1, e.Command)
+
+			}
+
+		}
+
+		rf.persist()
+
+		rf.commitIndex = min(len(rf.Log)-1, args.LeaderCommit)
+
+		rf.apply()
 	}
 
-	rf.apply()
 }
 
 func (rf *Raft) runCandidate(epochByRoleSnapshot uint64) {
@@ -461,7 +502,7 @@ func (rf *Raft) runCandidate(epochByRoleSnapshot uint64) {
 	rf.election.voteCount++
 	rf.mu.Unlock()
 
-	log.Printf("<INFO> [Start an election] me: %v / term: %v \n", rf.me, rf.currentTerm)
+	log.Printf("<INFO> [Start an election] me: %v / term: %v \n", rf.me, rf.CurrentTerm)
 
 	for i := range rf.peers {
 		if rf.me != i {
@@ -512,16 +553,16 @@ func (rf *Raft) sendRequestVote(epochByRoleSnapshot uint64, peer int, voted chan
 	}
 
 	args := &RequestVoteArgs{
-		Term:         rf.currentTerm,
+		Term:         rf.CurrentTerm,
 		CandidiateId: rf.me,
 	}
 
 	var lastLog Entry
 
-	if len(rf.log) > 0 {
-		lastLog = rf.log[len(rf.log)-1]
+	if len(rf.Log) > 0 {
+		lastLog = rf.Log[len(rf.Log)-1]
 		args.LastLogTerm = lastLog.Term
-		args.LastLogIndex = lastLog.Index
+		args.LastLogIndex = len(rf.Log) - 1
 	} else {
 		// if voter has at leat one entry, not granted
 		args.LastLogTerm = -1
@@ -550,12 +591,14 @@ func (rf *Raft) sendRequestVote(epochByRoleSnapshot uint64, peer int, voted chan
 
 	// election closed
 	// transit to Follower
-	if rf.currentTerm < reply.Term {
+	if rf.CurrentTerm < reply.Term {
 
-		rf.currentTerm = reply.Term
-		rf.votedFor = -1
+		rf.CurrentTerm = reply.Term
+		rf.VotedFor = -1
 
 		rf.transitRole(Follower)
+
+		rf.persist()
 
 		rf.mu.Unlock()
 
@@ -576,12 +619,16 @@ func (rf *Raft) sendRequestVote(epochByRoleSnapshot uint64, peer int, voted chan
 				}
 				rf.election.voteCount++
 
-				// validation to be Leader
-				if rf.election.voteCount >= len(rf.peers)/2+1 {
+				log.Printf("<INFO> [Grant the vote] me: %v / term: %v / voter: %v \n", rf.me, rf.CurrentTerm, peer)
 
-					log.Printf("<INFO> [Leader is elected] me: %v / term: %v \n", rf.me, rf.currentTerm)
+				// validation to be Leader
+				if rf.election.voteCount >= (len(rf.peers)/2)+1 {
+
+					log.Printf("<INFO> [Leader is elected] me: %v / term: %v \n", rf.me, rf.CurrentTerm)
 
 					rf.transitRole(Leader)
+
+					rf.persist()
 				}
 
 			} else {
@@ -616,12 +663,14 @@ func (rf *Raft) runLeader(epochByRoleSnapshot uint64) {
 		return
 	}
 
-	rf.nextIndex, rf.matchedIndex = make([]int, len(rf.peers)), make([]int, len(rf.peers))
+	rf.nextIndex, rf.matchedIndex, rf.matched = make([]int, len(rf.peers)), make([]int, len(rf.peers)), make([]bool, len(rf.peers))
 	for i := 0; i < len(rf.peers); i++ {
 		if i != rf.me {
-			rf.nextIndex[i] = len(rf.log)
+			rf.nextIndex[i] = len(rf.Log)
+			rf.matched[i] = false
 		} else {
-			rf.matchedIndex[i] = len(rf.log) - 1
+			rf.matchedIndex[i] = len(rf.Log) - 1
+			rf.matched[i] = true
 		}
 	}
 	rf.mu.Unlock()
@@ -689,19 +738,20 @@ func (rf *Raft) sendAppendEntries(epochByRoleSnapshot uint64, peer int, tickCoun
 	}
 
 	if peer == rf.me {
-		rf.matchedIndex[peer] = len(rf.log) - 1
+		rf.matchedIndex[peer] = len(rf.Log) - 1
 		rf.mu.Unlock()
 		return
 	}
 
 	args := &AppendEntriesArgs{
-		Term:     rf.currentTerm,
+		Term:     rf.CurrentTerm,
 		LeaderId: rf.me,
 	}
 
-	numEntriesOnRequest := 0
+	var indexToBeReplicated int
 
-	if rf.nextIndex[peer] > 0 {
+	if !rf.matched[peer] {
+		// if nextIndex[peer] == 0 => stop matching
 
 		rf.nextIndex[peer] = rf.nextIndex[peer] - NumberOfStepsForFindingMatchedIndex
 
@@ -710,26 +760,30 @@ func (rf *Raft) sendAppendEntries(epochByRoleSnapshot uint64, peer int, tickCoun
 		}
 
 		args.PrevLogIndex = rf.nextIndex[peer]
-		args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
+		args.PrevLogTerm = rf.Log[args.PrevLogIndex].Term
 		args.Entries = nil
+		args.WasMatched = false
 	} else {
-		args.PrevLogIndex = -1
-		args.PrevLogTerm = -1
+		args.WasMatched = true
 
 		args.Entries = make([]Entry, 0)
 
-		for i := 1; i <= MaxNumEntriesSentPerEachHeartbeat; i++ {
-			indexToBeReplicated := rf.matchedIndex[peer] + i
+		indexToBeReplicated = rf.matchedIndex[peer]
 
-			if indexToBeReplicated == len(rf.log) {
+		for i := 0; i < MaxNumEntriesSentPerEachHeartbeat; i++ {
+			indexToBeReplicated++
+
+			if indexToBeReplicated == len(rf.Log) {
+				indexToBeReplicated--
+
 				break
+			} else {
+				e := rf.Log[indexToBeReplicated]
+				args.Entries = append(args.Entries, e)
+
 			}
-
-			e := rf.log[indexToBeReplicated]
-			args.Entries = append(args.Entries, e)
-
-			numEntriesOnRequest++
 		}
+
 	}
 
 	args.LeaderCommit = rf.commitIndex
@@ -741,10 +795,8 @@ func (rf *Raft) sendAppendEntries(epochByRoleSnapshot uint64, peer int, tickCoun
 	ok := rf.peers[peer].Call("Raft.AppendEntries", args,
 		reply)
 
-	// no response => no ACK
 	if !ok {
-		// log.Printf("<ERROR> [RPC call was not responsed by network condition] me: %v / RPC method: %v \n",
-		// 	rf.me, "AppendEntries")
+		// drop
 		return
 	}
 
@@ -756,12 +808,14 @@ func (rf *Raft) sendAppendEntries(epochByRoleSnapshot uint64, peer int, tickCoun
 	}
 
 	// transit to Follower
-	if rf.currentTerm < reply.Term {
+	if rf.CurrentTerm < reply.Term {
 
-		rf.currentTerm = reply.Term
-		rf.votedFor = -1
+		rf.CurrentTerm = reply.Term
+		rf.VotedFor = -1
 
 		rf.transitRole(Follower)
+
+		rf.persist()
 
 		rf.mu.Unlock()
 
@@ -769,70 +823,43 @@ func (rf *Raft) sendAppendEntries(epochByRoleSnapshot uint64, peer int, tickCoun
 	}
 
 	if reply.Success {
-		if rf.nextIndex[peer] > 0 {
+		if !rf.matched[peer] {
 			rf.matchedIndex[peer] = rf.nextIndex[peer]
-			rf.nextIndex[peer] = 0
+			rf.matched[peer] = true
 		} else {
-			rf.matchedIndex[peer] = rf.matchedIndex[peer] + numEntriesOnRequest
+			if rf.matchedIndex[peer] < indexToBeReplicated {
+				// reordering
 
-			if rf.commit() {
-				rf.apply()
+				rf.matchedIndex[peer] = indexToBeReplicated // deduplication
+
 			}
+
+		}
+
+		if rf.commit() {
+			rf.apply()
 		}
 	} else {
 		if reply.metadata.XLen <= rf.nextIndex[peer] {
-			//  Case 1: follower's log is too short:
 			rf.nextIndex[peer] = reply.metadata.XLen
-		} else {
-
-			isTermMatched := false
-
-			var termMatchedIndex int
-			targetTerm := reply.metadata.XTerm
-			left, right := 0, len(rf.log)-1
-
-			for left <= right {
-				termMatchedIndex := left + (right-left)/2
-
-				if rf.log[termMatchedIndex].Term == targetTerm {
-					isTermMatched = true
-				} else if rf.log[termMatchedIndex].Term < targetTerm {
-					left = termMatchedIndex + 1
-				} else {
-					right = termMatchedIndex - 1
-				}
-			}
-
-			if isTermMatched {
-				// Case 2: leader has XTerm:
-				lastIndexAtTerm := termMatchedIndex
-
-				for ; lastIndexAtTerm < len(rf.log); lastIndexAtTerm++ {
-					if targetTerm < rf.log[lastIndexAtTerm].Term {
-						break
-					}
-				}
-
-				rf.nextIndex[peer] = lastIndexAtTerm
-			} else {
-				// Case 3: leader doesn't have XTerm:
-				rf.nextIndex[peer] = reply.metadata.XIndex // index of first entry with that term (if any)
-			}
 		}
+
 	}
 
 	rf.mu.Unlock()
 }
 
 func (rf *Raft) commit() bool {
-	if len(rf.log) == 0 || rf.log[len(rf.log)-1].Term < rf.currentTerm {
+	if len(rf.Log) == 0 {
+		// Committing entries from previous terms => at least one comitted entry at current term(to be the most up-to-date)
 		return false
 	}
 
 	start := rf.commitIndex
 	updated := start
+	isCommittedAtCurrentTerm := false
 
-	for indexToBeCommitted := start + 1; indexToBeCommitted < len(rf.log); indexToBeCommitted++ {
+	for indexToBeCommitted := start + 1; indexToBeCommitted < len(rf.Log); indexToBeCommitted++ {
 		matchedCount := 0
 		for j, _ := range rf.peers {
 			if rf.matchedIndex[j] >= indexToBeCommitted {
@@ -842,6 +869,9 @@ func (rf *Raft) commit() bool {
 
 		if matchedCount >= (len(rf.peers)/2)+1 {
 			updated = indexToBeCommitted
+			if rf.Log[updated].Term == rf.CurrentTerm {
+				isCommittedAtCurrentTerm = true
+			}
 		} else {
 			break
 		}
@@ -851,18 +881,23 @@ func (rf *Raft) commit() bool {
 		return false
 	}
 
+	if !isCommittedAtCurrentTerm {
+		return false
+	}
+
 	rf.commitIndex = updated
-	log.Printf("<INFO> [Commit index was updated] me: %v / role: %v / term: %v / commit_index: %v \n",
-		rf.me, rf.roleToStr(rf.roleState.role), rf.currentTerm, updated)
+
+	log.Printf("<INFO> [Commit index was updated] me: %v / role: %v / term: %v / commit_index_start: %v / commit_index_updated: %v / last_committed_term: %v \n",
+		rf.me, rf.roleToStr(rf.roleState.role), rf.CurrentTerm, start, updated, rf.Log[updated].Term)
 
 	return true
 }
 
 func (rf *Raft) apply() {
+	indexToBeApplied := rf.lastApplied + 1
+	for ; indexToBeApplied <= rf.commitIndex; indexToBeApplied++ {
 
-	for indexToBeApplied := rf.lastApplied + 1; indexToBeApplied <= rf.commitIndex; indexToBeApplied++ {
-
-		e := rf.log[indexToBeApplied]
+		e := rf.Log[indexToBeApplied]
 
 		msg := raftapi.ApplyMsg{
 			CommandValid: true,
@@ -874,8 +909,8 @@ func (rf *Raft) apply() {
 
 		rf.lastApplied = indexToBeApplied
 
-		log.Printf("<INFO> [Log was applied] me: %v / role: %v / term: %v / log_index: %v \n",
-			rf.me, rf.roleToStr(rf.roleState.role), rf.currentTerm, rf.lastApplied)
+		log.Printf("<INFO> [Log was applied] me: %v / role: %v / term: %v / applied_index: %v / applied_log_term: %v /command: %v \n",
+			rf.me, rf.roleToStr(rf.roleState.role), rf.CurrentTerm, rf.lastApplied, e.Term, e.Command)
 	}
 }
 
@@ -918,6 +953,9 @@ func (rf *Raft) runRoleTransitioner() {
 			rf.resetElectionTimeout()
 
 		case <-rf.exitSync.ctx.Done():
+
+			rf.exitRole()
+			log.Printf("<INFO [Role transitioner loop was stopped] me: %v ", rf.me)
 			return
 		}
 	}
@@ -932,7 +970,7 @@ func (rf *Raft) transitRole(newRole Role) {
 	rf.roleState.role = newRole
 	rf.roleState.epochByRole++
 
-	term = rf.currentTerm
+	term = rf.CurrentTerm
 	nextEpoch = rf.roleState.epochByRole
 
 	log.Printf("<INFO> [Role was transitioned] me %v / term: %v / old role: %v / new role: %v / Epoch: %v \n",
@@ -951,6 +989,29 @@ func (rf *Raft) transitRole(newRole Role) {
 
 	}()
 
+}
+
+func (rf *Raft) exitRole() {
+	// fence for active workers with current role
+	rf.mu.Lock()
+	rf.roleState.epochByRole++
+	rf.mu.Unlock()
+
+	// sync
+	if rf.roleState.roleTransition.ctx != nil && rf.roleState.roleTransition.cancel != nil {
+		rf.roleState.roleTransition.cancel()
+		rf.roleState.roleTransition.wg.Wait()
+	}
+
+	// drain concurrent senders for role transition
+	for {
+		select {
+		case <-rf.roleState.roleTransition.roleTransitionChan:
+
+		default:
+			return
+		}
+	}
 }
 
 func (rf *Raft) isFencedByRoleTransition(epochByRoleSnapshot uint64) bool {
@@ -987,12 +1048,14 @@ func (rf *Raft) runElectionTimeout() {
 					break
 				}
 
-				log.Printf("<INFO> [Election timeout was expired] me: %v / term: %v \n", rf.me, rf.currentTerm)
+				log.Printf("<INFO> [Election timeout was expired] me: %v / term: %v \n", rf.me, rf.CurrentTerm)
 
-				rf.currentTerm++
-				rf.votedFor = rf.me
+				rf.CurrentTerm++
+				rf.VotedFor = rf.me
 
 				rf.transitRole(Candidate)
+
+				rf.persist()
 
 				rf.mu.Unlock()
 
@@ -1000,6 +1063,7 @@ func (rf *Raft) runElectionTimeout() {
 
 		case <-rf.exitSync.ctx.Done():
 			onTick.Stop()
+			log.Printf("<INFO [Election timeout loop was stopped] me: %v ", rf.me)
 			return
 		}
 	}
@@ -1028,25 +1092,26 @@ func (rf *Raft) shouldResetElectionTimeout() bool {
 // for any long-running work.
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *tester.Persister, applyCh chan raftapi.ApplyMsg) raftapi.Raft {
+
 	rf := &Raft{}
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
 
-	// Your initialization code here (3A, 3B, 3C).
-	rf.votedFor = -1
-	rf.log = make([]Entry, 0)
-	dummyEntry := Entry{Index: 0, Term: 0}
-	rf.log = append(rf.log, dummyEntry)
+	// initialize from state persisted before a crash
+
+	if !rf.readPersist(persister.ReadRaftState()) {
+		rf.VotedFor = -1
+		rf.Log = make([]Entry, 0)
+		dummyEntry := Entry{Index: 0, Term: 0, Command: nil}
+		rf.Log = append(rf.Log, dummyEntry)
+	}
 
 	rf.applier = applyCh
-
 	rf.roleState.roleTransition.roleTransitionChan = make(chan RoleTransitionMsg)
-
 	rf.exitSync.ctx, rf.exitSync.cancel = context.WithCancel(context.Background())
 
-	// initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState())
+	log.Printf("<INFO> [Raft node was started] me: %v \n", me)
 
 	go rf.runRoleTransitioner()
 	go rf.runElectionTimeout()
