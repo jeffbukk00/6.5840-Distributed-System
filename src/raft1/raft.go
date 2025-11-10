@@ -464,6 +464,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 		for _, e := range args.Entries {
 			if e.Index == len(rf.Log) {
+				// reordering
+
 				rf.Log = append(rf.Log, e)
 
 				log.Printf("<INFO> [Log was replicated] me: %v / role: %v / term: %v / index: %v / command: %v  \n",
